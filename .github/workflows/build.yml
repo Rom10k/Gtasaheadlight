@@ -1,0 +1,44 @@
+name: Build HeadlightTuner
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get AML headers
+        run: git clone --depth 1 https://github.com/RusJJ/AndroidModLoader.git aml
+
+      - name: Find AML include folder
+        run: |
+          H=$(find aml -name amlmod.h | head -n 1)
+          if [ -z "$H" ]; then
+            echo "amlmod.h not found in the AML repo. Folder tree:"
+            find aml -maxdepth 3 -not -path '*/.git*'
+            exit 1
+          fi
+          echo "Found: $H"
+          # <mod/amlmod.h> must resolve, so the include dir is the parent of the 'mod' folder
+          INC=$(dirname "$(dirname "$H")")
+          echo "AML include dir: $INC"
+          echo "AML_INC=$PWD/$INC" >> $GITHUB_ENV
+
+      - name: Build (armeabi-v7a)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-21 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAML_INCLUDE=$AML_INC
+          cmake --build build -j
+
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: libHeadlightTuner
+          path: build/libHeadlightTuner.so
