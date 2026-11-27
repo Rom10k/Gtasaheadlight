@@ -19,7 +19,7 @@
 #include <cmath>
 #include <cstring>
 
-MYMODCFG(net.user.headlighttuner, Headlight Tuner, 2.0.0, user)
+MYMODCFG(net.user.headlighttuner, Headlight Tuner, 2.1.0, user)
 
 struct CVector { float x, y, z; };
 
@@ -39,6 +39,8 @@ struct TunerCfg
     float wallRange      = 25.0f;  // m: how far the beam reaches
     float wallCone       = 0.45f;  // sideways spread of the beam (0.45 ~ 24 degrees)
     float wallConeV      = 0.16f;  // vertical spread
+    int   texture        = 1;      // wall light texture: -1 = headlight.png, 0..9 = the game's corona textures (1 = soft round glow)
+    int   rays           = 3;      // rays per axis (3 or 5): more = smoother but slower
     int   maxLights      = 6;      // lit headlights processed per frame (nearest first is not guaranteed)
     float maxDistance    = 70.0f;  // m: headlights further than this from the player are ignored
     int   updateFrames   = 2;      // the patches are rebuilt every N frames
@@ -63,6 +65,8 @@ static void LoadCfg()
     g_cfg.wallRange      = cfg->Bind("Range",          d.wallRange,      "WallLight")->GetFloat();
     g_cfg.wallCone       = cfg->Bind("ConeWidth",      d.wallCone,       "WallLight")->GetFloat();
     g_cfg.wallConeV      = cfg->Bind("ConeHeight",     d.wallConeV,      "WallLight")->GetFloat();
+    g_cfg.texture        = cfg->Bind("TextureIndex",   d.texture,        "WallLight")->GetInt();
+    g_cfg.rays           = cfg->Bind("Rays",           d.rays,           "WallLight")->GetInt();
     g_cfg.maxLights      = cfg->Bind("MaxLights",      d.maxLights,      "WallLight")->GetInt();
     g_cfg.maxDistance    = cfg->Bind("MaxDistance",    d.maxDistance,    "WallLight")->GetFloat();
     g_cfg.updateFrames   = cfg->Bind("UpdateFrames",   d.updateFrames,   "WallLight")->GetInt();
@@ -71,6 +75,8 @@ static void LoadCfg()
     g_cfg.originSpread   = cfg->Bind("OriginSpread",   d.originSpread,   "WallLight")->GetFloat();
     cfg->Save();
 
+    if (g_cfg.rays < 2) g_cfg.rays = 2;
+    if (g_cfg.rays > 5) g_cfg.rays = 5;
     if (g_cfg.maxLights < 0) g_cfg.maxLights = 0;
     if (g_cfg.maxLights > 12) g_cfg.maxLights = 12;
     if (g_cfg.updateFrames < 1) g_cfg.updateFrames = 1;
@@ -120,6 +126,7 @@ static inline uint8_t Clamp255(float v) { return v < 0 ? 0 : (v > 255 ? 255 : (u
 // ---------------------------------------------------------------------------------------------
 // 1) ground light
 static void* g_lightTex = NULL;     // the headlight texture seen in StoreCarLightShadow
+static void** g_coronaTex = NULL;   // gpCoronaTexture[] of the game (soft round glows)
 
 static void Store_hook(void* veh, int id, void* tex, CVector* pos,
                        float fx, float fy, float sx, float sy,
@@ -177,7 +184,7 @@ static void Beam_hook(void* veh, int dummyId, float* m, uint8_t left)
     g_lightCount++;
 }
 
-static const int MAX_QUADS = 12 * 9;
+static const int MAX_QUADS = 12 * 25;
 static Vertex3D  g_verts[MAX_QUADS * 4];
 static uint16_t  g_indices[MAX_QUADS * 6];
 static int       g_quadCount = 0;
@@ -193,8 +200,11 @@ static void BuildQuads(const CVector& playerPos)
 {
     g_quadCount = 0;
     int used = 0;
-    static const float DX[3] = { -1.0f, 0.0f, 1.0f };
-    static const float DZ[3] = { -1.0f, 0.0f, 1.0f };
+    const int N = g_cfg.rays;
+    float OFF[5];
+    for (int k = 0; k < N; k++) OFF[k] = N > 1 ? -1.0f + 2.0f * (float)k / (float)(N - 1) : 0.0f;
+    const float* DX = OFF;
+    const float* DZ = OFF;
 
     for (int i = 0; i < g_lightCount && used < g_cfg.maxLights; i++)
     {
@@ -203,8 +213,8 @@ static void BuildQuads(const CVector& playerPos)
         if (Len(dp) > g_cfg.maxDistance) continue;
         used++;
 
-        for (int ix = 0; ix < 3; ix++)
-        for (int iz = 0; iz < 3; iz++)
+        for (int ix = 0; ix < N; ix++)
+        for (int iz = 0; iz < N; iz++)
         {
             if (g_quadCount >= MAX_QUADS) return;
 
@@ -274,8 +284,11 @@ static void BuildQuads(const CVector& playerPos)
 
 static void DrawQuads()
 {
-    if (g_quadCount <= 0 || !g_lightTex) return;
-    void* raster = *(void**)g_lightTex;                       // RwTexture::raster is the first member
+    void* tex = g_lightTex;
+    if (g_cfg.texture >= 0 && g_cfg.texture < 10 && g_coronaTex && g_coronaTex[g_cfg.texture])
+        tex = g_coronaTex[g_cfg.texture];                       // soft round glow instead of headlight.png
+    if (g_quadCount <= 0 || !tex) return;
+    void* raster = *(void**)tex;                               // RwTexture::raster is the first member
     if (!raster) return;
 
     // remember and set the render states
@@ -355,6 +368,7 @@ extern "C" void OnModLoad()
     RwIm3DTransform_f  = (RwIm3DTransform_t) aml->GetSym(h, "_Z15RwIm3DTransformP18RxObjSpace3DVertexjP11RwMatrixTagj");
     RwIm3DRender_f     = (RwIm3DRenderIndexedPrimitive_t)aml->GetSym(h, "_Z28RwIm3DRenderIndexedPrimitive15RwPrimitiveTypePti");
     RwIm3DEnd_f        = (RwIm3DEnd_t)       aml->GetSym(h, "_Z9RwIm3DEndv");
+    g_coronaTex        = (void**)            aml->GetSym(h, "gpCoronaTexture");
 
     if (beamAddr && coronasAddr && LOS_f && FindPlayerCoors_f && RwRenderStateSet_f && RwRenderStateGet_f &&
         RwIm3DTransform_f && RwIm3DRender_f && RwIm3DEnd_f)
@@ -365,5 +379,5 @@ extern "C" void OnModLoad()
     }
     else logger->Error("Wall light disabled: missing game symbols");
 
-    logger->Info("HeadlightTuner v2 loaded");
+    logger->Info("HeadlightTuner v2.1 loaded");
 }
