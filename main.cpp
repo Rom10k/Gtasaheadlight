@@ -19,7 +19,7 @@
 #include <cmath>
 #include <cstring>
 
-MYMODCFG(net.user.headlighttuner, Headlight Tuner, 2.2.1, user)
+MYMODCFG(net.user.headlighttuner, Headlight Tuner, 2.3.0, user)
 
 struct CVector { float x, y, z; };
 
@@ -41,7 +41,9 @@ struct TunerCfg
     float wallConeV      = 0.16f;  // vertical spread
     int   texture        = 1;      // wall light texture: -1 = headlight.png, 0..9 = the game's corona textures (1 = soft round glow)
     int   rays           = 3;      // minimum rays per axis near a surface (the number grows with distance)
-    int   maxRaysX       = 9;      // most rays sideways per headlight (far surfaces use more, close ones fewer)
+    float rayGrowth      = 0.45f;  // rays added per metre of distance (how fast the patch count grows when the surface is far)
+    float overlap        = 1.3f;   // patch size relative to the gap between patches (1.0 = just touching, 1.3 = slightly overlapping)
+    int   maxRaysX       = 11;     // most rays sideways per headlight (far surfaces use more, close ones fewer)
     int   maxRaysZ       = 5;      // most rays up/down per headlight
     float groundZ        = 0.88f;  // surfaces flatter than this (normal.z) are left to the game's own ground light; slopes are lit
     int   rayBudget      = 160;    // most rays per rebuild over ALL headlights (keeps the frame rate)
@@ -72,6 +74,8 @@ static void LoadCfg()
     g_cfg.wallConeV      = cfg->Bind("ConeHeight",     d.wallConeV,      "WallLight")->GetFloat();
     g_cfg.texture        = cfg->Bind("TextureIndex",   d.texture,        "WallLight")->GetInt();
     g_cfg.rays           = cfg->Bind("Rays",           d.rays,           "WallLight")->GetInt();
+    g_cfg.rayGrowth      = cfg->Bind("RayGrowth",      d.rayGrowth,      "WallLight")->GetFloat();
+    g_cfg.overlap        = cfg->Bind("PatchOverlap",   d.overlap,        "WallLight")->GetFloat();
     g_cfg.maxRaysX       = cfg->Bind("MaxRaysX",       d.maxRaysX,       "WallLight")->GetInt();
     g_cfg.maxRaysZ       = cfg->Bind("MaxRaysZ",       d.maxRaysZ,       "WallLight")->GetInt();
     g_cfg.groundZ        = cfg->Bind("GroundNormalZ",  d.groundZ,        "WallLight")->GetFloat();
@@ -92,6 +96,9 @@ static void LoadCfg()
     if (g_cfg.maxRaysZ < g_cfg.rays) g_cfg.maxRaysZ = g_cfg.rays;
     if (g_cfg.maxRaysZ > 9) g_cfg.maxRaysZ = 9;
     if (g_cfg.rayBudget < 20) g_cfg.rayBudget = 20;
+    if (g_cfg.rayGrowth < 0.0f) g_cfg.rayGrowth = 0.0f;
+    if (g_cfg.overlap < 0.3f) g_cfg.overlap = 0.3f;
+    if (g_cfg.overlap > 4.0f) g_cfg.overlap = 4.0f;
     if (g_cfg.groundZ < 0.3f) g_cfg.groundZ = 0.3f;
     if (g_cfg.groundZ > 1.0f) g_cfg.groundZ = 1.0f;
     if (g_cfg.maxLights < 0) g_cfg.maxLights = 0;
@@ -180,7 +187,7 @@ static void Store_hook(void* veh, int id, void* tex, CVector* pos,
 
 // ---------------------------------------------------------------------------------------------
 // 2) wall light
-struct BeamLight { CVector pos; CVector dir; CVector right; CVector up; };
+struct BeamLight { CVector pos; CVector dir; CVector right; CVector up; void* veh; };
 static BeamLight g_lights[16];
 static int       g_lightCount = 0;
 
@@ -191,6 +198,7 @@ static void Beam_hook(void* veh, int dummyId, float* m, uint8_t left)
 
     // CMatrix: right(0) up(16) = driving direction, at(32), pos(48)
     BeamLight& L = g_lights[g_lightCount];
+    L.veh   = veh;
     L.right = { m[0], m[1], m[2] };
     L.dir   = { m[4], m[5], m[6] };
     L.up    = { m[8], m[9], m[10] };
@@ -250,19 +258,43 @@ static inline bool Similar(const Hit& a, const Hit& b, float tol)
 static void BuildQuads(const CVector& playerPos)
 {
     g_quadCount = 0;
-    int used = 0;
     const int MAXX = 15, MAXZ = 9;
     static Hit hits[MAXX][MAXZ];
 
-    int eligible = 0;
-    for (int i = 0; i < g_lightCount && eligible < g_cfg.maxLights; i++)
-        if (Len(Sub(g_lights[i].pos, playerPos)) <= g_cfg.maxDistance) eligible++;
-    if (eligible < 1) return;
-    const int perLight = g_cfg.rayBudget / eligible;            // rays this headlight may use (incl. the axis ray)
-
-    for (int i = 0; i < g_lightCount && used < g_cfg.maxLights; i++)
+    // 0) both headlights of one car are merged into ONE beam, so that there is a single even
+    //    lattice of patches instead of two interleaved ones (which looked like pairs with gaps)
+    BeamLight comb[16];
+    int cnt[16];
+    int nc = 0;
+    for (int i = 0; i < g_lightCount; i++)
     {
         const BeamLight& L = g_lights[i];
+        int k = -1;
+        for (int j = 0; j < nc; j++) if (comb[j].veh == L.veh) { k = j; break; }
+        if (k < 0) { k = nc++; comb[k] = L; cnt[k] = 1; continue; }
+        comb[k].pos   = { comb[k].pos.x + L.pos.x,     comb[k].pos.y + L.pos.y,     comb[k].pos.z + L.pos.z };
+        comb[k].dir   = { comb[k].dir.x + L.dir.x,     comb[k].dir.y + L.dir.y,     comb[k].dir.z + L.dir.z };
+        comb[k].right = { comb[k].right.x + L.right.x, comb[k].right.y + L.right.y, comb[k].right.z + L.right.z };
+        comb[k].up    = { comb[k].up.x + L.up.x,       comb[k].up.y + L.up.y,       comb[k].up.z + L.up.z };
+        cnt[k]++;
+    }
+    for (int j = 0; j < nc; j++)
+    {
+        float inv = 1.0f / (float)cnt[j];
+        comb[j].pos = { comb[j].pos.x * inv, comb[j].pos.y * inv, comb[j].pos.z * inv };
+        comb[j].dir = Norm(comb[j].dir); comb[j].right = Norm(comb[j].right); comb[j].up = Norm(comb[j].up);
+    }
+
+    int eligible = 0;
+    for (int i = 0; i < nc && eligible < g_cfg.maxLights; i++)
+        if (Len(Sub(comb[i].pos, playerPos)) <= g_cfg.maxDistance) eligible++;
+    if (eligible < 1) return;
+    const int perLight = g_cfg.rayBudget / eligible;            // rays one car may use (incl. the axis ray)
+
+    int used = 0;
+    for (int i = 0; i < nc && used < g_cfg.maxLights; i++)
+    {
+        const BeamLight& L = comb[i];
         if (Len(Sub(L.pos, playerPos)) > g_cfg.maxDistance) continue;
         used++;
 
@@ -272,14 +304,9 @@ static void BuildQuads(const CVector& playerPos)
         CastRay(L, axis, centre);
         float D0 = centre.valid ? centre.dist : g_cfg.wallRange * 0.6f;
 
-        // 2) patch size grows slowly with distance; the number of rays grows with it, so far surfaces
-        //    get MANY close patches and near ones FEW (but still touching each other)
-        float halfBase = g_cfg.wallSize * (0.55f + 0.07f * D0);
-        if (halfBase > 3.0f) halfBase = 3.0f;
-        float spacing = halfBase * 0.9f;
-        int nx = (int)std::ceil((2.0f * D0 * g_cfg.wallCone)  / spacing) + 1;
-        int nz = (int)std::ceil((2.0f * D0 * g_cfg.wallConeV) / spacing) + 1;
-        if (nx < g_cfg.rays) nx = g_cfg.rays;
+        // 2) the number of rays (= patches) grows with the distance, RayGrowth sets how fast
+        int nx = g_cfg.rays + (int)(g_cfg.rayGrowth * D0 + 0.5f);
+        int nz = (int)((float)(nx - 1) * g_cfg.wallConeV / g_cfg.wallCone + 0.5f) + 1;
         if (nz < g_cfg.rays) nz = g_cfg.rays;
         if (nx > g_cfg.maxRaysX) nx = g_cfg.maxRaysX;
         if (nz > g_cfg.maxRaysZ) nz = g_cfg.maxRaysZ;
@@ -290,7 +317,7 @@ static void BuildQuads(const CVector& playerPos)
             else nx--;
         }
 
-        // 3) cast the grid
+        // 3) cast the grid (uniform in the beam's own plane)
         CVector dirs[MAXX][MAXZ];
         for (int ix = 0; ix < nx; ix++)
         for (int iz = 0; iz < nz; iz++)
@@ -316,7 +343,6 @@ static void BuildQuads(const CVector& playerPos)
             if (fall <= 0.02f || h.facing <= 0.04f) continue;
 
             // patch frame: u = the direction the light travels along the surface, v = across it.
-            // Grazing light (slopes, hills, oblique walls) gives a stretched ellipse.
             const CVector& d = dirs[ix][iz];
             CVector proj = { d.x - h.n.x * Dot(d, h.n), d.y - h.n.y * Dot(d, h.n), d.z - h.n.z * Dot(d, h.n) };
             CVector u;
@@ -329,37 +355,41 @@ static void BuildQuads(const CVector& playerPos)
             }
             CVector v = Norm(Cross(h.n, u));
 
-            float half  = halfBase * (0.75f + 0.25f * fall);
-            float halfU = half / (h.facing < 0.4f ? 0.4f : h.facing);   // stretch along the light direction
+            // patch size = the gap between neighbouring patches at this distance * PatchOverlap * Size,
+            // so the lattice looks even whatever the distance or the number of rays is
+            float cellW = h.dist * 2.0f * g_cfg.wallCone  / (float)(nx > 1 ? nx - 1 : 1);
+            float cellH = h.dist * 2.0f * g_cfg.wallConeV / (float)(nz > 1 ? nz - 1 : 1);
+            float half  = 0.5f * (cellW > cellH ? cellW : cellH) * g_cfg.overlap * g_cfg.wallSize;
+            if (half < 0.25f) half = 0.25f;
+            if (half > 4.0f)  half = 4.0f;
+            float halfU = half / (h.facing < 0.4f ? 0.4f : h.facing);   // grazing light gives a stretched ellipse
             if (halfU > half * 2.5f) halfU = half * 2.5f;
             float halfV = half;
 
-            // thin / small objects: neighbouring rays that miss or hit something much further away
-            // mean the surface is narrower than the patch -> make the patch narrower in that direction
+            // thin / small objects: neighbouring rays that miss or hit something far away mean the
+            // surface is narrower than the patch -> a narrower patch in that direction (mild)
             if (g_cfg.thinObjects)
             {
-                float tolH = 0.6f + 0.12f * h.dist;
-                float tolV = 1.0f + 0.35f * h.dist;
+                float tolH = 1.0f + 0.2f * h.dist;
+                float tolV = 1.5f + 0.4f * h.dist;
                 bool contX = true, contZ = true;
                 if (ix > 0)      contX = contX && Similar(h, hits[ix - 1][iz], tolH);
                 if (ix < nx - 1) contX = contX && Similar(h, hits[ix + 1][iz], tolH);
                 if (iz > 0)      contZ = contZ && Similar(h, hits[ix][iz - 1], tolV);
                 if (iz < nz - 1) contZ = contZ && Similar(h, hits[ix][iz + 1], tolV);
                 bool uHoriz = std::sqrt(u.x * u.x + u.y * u.y) > 0.7f;
-                float kX = contX ? 1.0f : 0.35f, kZ = contZ ? 1.0f : 0.35f;
+                float kX = contX ? 1.0f : 0.5f, kZ = contZ ? 1.0f : 0.5f;
                 if (uHoriz) { halfU *= kX; halfV *= kZ; } else { halfU *= kZ; halfV *= kX; }
-                if (halfU < 0.1f) halfU = 0.1f;
-                if (halfV < 0.1f) halfV = 0.1f;
+                if (halfU < 0.12f) halfU = 0.12f;
+                if (halfV < 0.12f) halfV = 0.12f;
             }
 
-            // overlapping patches add up: keep the brightness even whatever the ray density is
-            float cellW = h.dist * 2.0f * g_cfg.wallCone  / (float)(nx > 1 ? nx - 1 : 1);
-            float cellH = h.dist * 2.0f * g_cfg.wallConeV / (float)(nz > 1 ? nz - 1 : 1);
-            float cell  = cellW * cellH / (h.facing < 0.3f ? 0.3f : h.facing);
-            float overlap = (4.0f * halfU * halfV) / (cell > 0.05f ? cell : 0.05f);
-            float norm = 1.6f / (overlap < 1.6f ? 1.6f : overlap);
+            // overlapping patches add up: keep the brightness even
+            float cell    = cellW * cellH / (h.facing < 0.3f ? 0.3f : h.facing);
+            float overlapF = (4.0f * halfU * halfV) / (cell > 0.05f ? cell : 0.05f);
+            float norm = 1.6f / (overlapF < 1.6f ? 1.6f : overlapF);
 
-            float axisW = 1.0f - 0.35f * (std::fabs(-1.0f + 2.0f * (float)ix / (float)(nx > 1 ? nx - 1 : 1)) +
+            float axisW = 1.0f - 0.30f * (std::fabs(-1.0f + 2.0f * (float)ix / (float)(nx > 1 ? nx - 1 : 1)) +
                                           std::fabs(-1.0f + 2.0f * (float)iz / (float)(nz > 1 ? nz - 1 : 1)) * 0.5f);
             uint8_t a = Clamp255(g_cfg.wallBrightness * fall * fall * h.facing * axisW * norm * 255.0f);
             if (a < 3) continue;
@@ -487,5 +517,5 @@ extern "C" void OnModLoad()
     }
     else logger->Error("Wall light disabled: missing game symbols");
 
-    logger->Info("HeadlightTuner v2.2 loaded");
+    logger->Info("HeadlightTuner v2.3 loaded");
 }
